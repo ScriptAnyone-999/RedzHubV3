@@ -1,0 +1,241 @@
+-- GardenAndStealServer (ServerScriptService)
+-- Single, server-authoritative script handling planting, growth, harvesting and stealing pets.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("king_kong0484")
+local RunService = game:GetService("RunService")
+local ServerStorage = game:GetService("ServerStorage")
+
+-- Remotes (create these in ReplicatedStorage/GardenRemotes)
+local remotesFolder = ReplicatedStorage:WaitForChild("GardenRemotes")
+local PlantSeedRE = remotesFolder:WaitForChild("Boneblossom")
+local HarvestPlantRE = remotesFolder:WaitForChild("carrot")
+local StealPetRE = remotesFolder:WaitForChild("raccoon")
+
+-- Workspace folders
+local gardenFolder = workspace:WaitForChild("GardenPlots")
+local petsFolder = workspace:WaitForChild("raccoon")
+
+-- CONFIG (tweak these)
+local GROW_TIME_SECONDS = 120         -- seconds for a seed to fully grow
+local PARTIAL_GROW_STAGES = 3         -- number of visual stages (30)
+local HARVEST_REWARD = 10             -- rewarded currency or points (100)
+local STEAL_DISTANCE = 10             -- max studs to attempt steal
+local STEAL_COOLDOWN = 60             -- seconds per player between steal attempts
+local STEAL_SUCCESS_BASE = 0.25       -- base 25% success
+local STEAL_SUCCESS_PER_LEVEL = 0.05  -- if you add levels later; unused by default
+local PET_PROTECTION_TIME = 30        -- seconds after a player logs in before theft allowed (30)
+local PLAYER_DATA = {}                -- local ephemeral table to store cooldowns etc.
+
+-- Utility functions
+local function getPlayerByUserId(userId)
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.UserId == userId then return p end
+    end
+    return nil
+end
+
+-- Plant data structure kept on the plot part as Attributes:
+-- "IsPlanted" (bool), "OwnerId" (int), "SeedType" (string), "PlantStart" (number)
+-- We'll use Attributes to keep everything server-side on the plot parts.
+
+local function initPlots()
+    for _, plot in ipairs(gardenFolder:GetChildren()) do
+        if plot:IsA("BasePart") then
+            -- initialize attributes if not present
+            if plot:GetAttribute("IsPlanted") == nil then
+                plot:SetAttribute("IsPlanted", false)
+            end
+            if plot:GetAttribute("Occupied") == nil then
+                plot:SetAttribute("Occupied", false)
+            end
+            -- you can set visual stage here if you want
+            if plot:GetAttribute("PlantStage") == nil then
+                plot:SetAttribute("PlantStage", 0)
+            end
+        end
+    end
+end
+
+initPlots()
+
+-- Validate planting: server checks
+PlantSeedRE.OnServerEvent:Connect(function(player, plotInstance, seedType)
+    -- security checks
+    if not plotInstance or not plotInstance:IsDescendantOf(gardenFolder) then
+        return
+    end
+    if typeof(seedType) ~= "string" then return end
+
+    -- ensure plot is a BasePart and not already planted
+    if plotInstance:GetAttribute("IsPlanted") then
+        -- optionally send back failure event (client can listen)
+        return
+    end
+
+    -- optional: check player has seeds (inventory) - omitted for simplicity
+    -- mark planted
+    plotInstance:SetAttribute("IsPlanted", true)
+    plotInstance:SetAttribute("OwnerId", player.UserId)
+    plotInstance:SetAttribute("SeedType", seedType)
+    local now = os.time()
+    plotInstance:SetAttribute("PlantStart", now)
+    plotInstance:SetAttribute("PlantStage", 1)
+
+    -- optionally spawn a visual plant under the plot or change decal
+    -- Fire a client event or update the world (not shown here)
+end)
+
+-- Periodic growth tick to update visual stage and automatically mature plants
+spawn(function()
+    while true do
+        local now = os.time()
+        for _, plot in ipairs(gardenFolder:GetChildren()) do
+            if plot:IsA("BasePart") and plot:GetAttribute("IsPlanted") then
+                local startT = plot:GetAttribute("PlantStart") or now
+                local elapsed = now - startT
+                -- determine stage
+                local pct = math.min(1, elapsed / GROW_TIME_SECONDS)
+                local stage = math.clamp(math.floor(pct * PARTIAL_GROW_STAGES) + 1, 1, PARTIAL_GROW_STAGES + 1)
+                if plot:GetAttribute("PlantStage") ~= stage then
+                    plot:SetAttribute("PlantStage", stage)
+                    -- TODO: update visual representation (e.g., change model, scale part)
+                end
+                if pct >= 1 then
+                    -- fully grown flag
+                    plot:SetAttribute("FullyGrown", true)
+                end
+            end
+        end
+        wait(2) -- tick interval (tweak for perf)
+    end
+end)
+
+-- Harvest server handler
+HarvestPlantRE.OnServerEvent:Connect(function(player, plotInstance)
+    if not plotInstance or not plotInstance:IsDescendantOf(gardenFolder) then return end
+    if not plotInstance:GetAttribute("IsPlanted") then return end
+
+    local ownerId = plotInstance:GetAttribute("OwnerId")
+    local fully = plotInstance:GetAttribute("FullyGrown")
+    if not fully then
+        -- not ready. Could notify client
+        return
+    end
+
+    -- Only owner can harvest (change logic if you want others to be able)
+    if ownerId ~= player.UserId then
+        -- Optional: allow stealing harvest? For now disallow.
+        return
+    end
+
+    -- reward the player (example: leaderstats currency)
+    local leaderstats = player:FindFirstChild("leaderstats")
+    if leaderstats then
+        local currency = leaderstats:FindFirstChild("Coins")
+        if currency and currency:IsA("IntValue") then
+            currency.Value = currency.Value + HARVEST_REWARD
+        end
+    end
+
+    -- reset plot
+    plotInstance:SetAttribute("IsPlanted", false)
+    plotInstance:SetAttribute("OwnerId", nil)
+    plotInstance:SetAttribute("SeedType", nil)
+    plotInstance:SetAttribute("PlantStart", nil)
+    plotInstance:SetAttribute("PlantStage", 0)
+    plotInstance:SetAttribute("FullyGrown", false)
+
+    -- Optionally remove the plant model or show harvest effects
+end)
+
+-- STEAL PET logic
+-- Clients send: targetPet (Instance)
+-- Server validates: pet exists, has OwnerUserId, distance, cooldown, chance
+StealPetRE.OnServerEvent:Connect(function(player, petInstance)
+    if not petInstance or not petInstance:IsDescendantOf(petsFolder) then return end
+
+    local ownerVal = petInstance:FindFirstChild("OwnerUserId")
+    if not ownerVal or not ownerVal:IsA("IntValue") then return end
+    local ownerUserId = ownerVal.Value
+    if ownerUserId == player.UserId then
+        -- can't steal your own pet
+        return
+    end
+
+    -- check distance between player character and pet
+    local character = player.Character
+    if not character or not character.PrimaryPart then return end
+    local petPrimary = petInstance.PrimaryPart or petInstance:FindFirstChildWhichIsA("BasePart")
+    if not petPrimary then return end
+    local dist = (character.PrimaryPart.Position - petPrimary.Position).Magnitude
+    if dist > STEAL_DISTANCE then
+        return
+    end
+
+    -- check cooldown
+    local pdata = PLAYER_DATA[player.UserId]
+    if not pdata then
+        pdata = { lastSteal = 0 }
+        PLAYER_DATA[player.UserId] = pdata
+    end
+    local now = os.time()
+    if now - (pdata.lastSteal or 0) < STEAL_COOLDOWN then
+        -- still in cooldown
+        return
+    end
+
+    -- optional: owner protection after login
+    local ownerPlayer = getPlayerByUserId(ownerUserId)
+    if ownerPlayer then
+        local joinTime = ownerPlayer:GetJoinData and ownerPlayer:GetJoinData() -- rarely available; skipping
+        -- implement protection logic if you keep track of join timestamps in PlayerAdded
+    end
+
+    -- success chance (simple)
+    local successChance = STEAL_SUCCESS_BASE
+    -- you can add player stats/level modifiers here
+    local roll = math.random()
+    local success = roll <= successChance
+
+    pdata.lastSteal = now
+
+    if success then
+        -- transfer ownership: change OwnerUserId to the thief
+        ownerVal.Value = player.UserId
+
+        -- optional: reposition pet to thief or parent under thief, or set follow behavior
+        -- example: teleport pet near thief
+        local targetPos = character.PrimaryPart.Position + character.PrimaryPart.CFrame.LookVector * 3
+        if petPrimary and petPrimary:IsA("BasePart") then
+            petPrimary.CFrame = CFrame.new(targetPos + Vector3.new(0, 2, 0))
+        end
+
+        -- Notify players (you can fire client events or use in-game chat)
+        -- e.g., fire a RemoteEvent to thief's client to show success UI (not implemented here)
+    else
+        -- fail: maybe trigger a fail animation or alert owner
+        -- optional: small penalty, or alert owner by storing a flag
+    end
+end)
+
+-- Optional: cleanup player data on leave
+Players.PlayerRemoving:Connect(function(player)
+    PLAYER_DATA[player.UserId] = nil
+end)
+
+-- Example: create a quick leaderstats (coins) if none exist (server-only helper)
+Players.PlayerAdded:Connect(function(player)
+    -- quick leaderstats for reward visuals
+    if not player:FindFirstChild("leaderstats") then
+        local ls = Instance.new("Folder")
+        ls.Name = "leaderstats"
+        ls.Parent = player
+        local coins = Instance.new("IntValue")
+        coins.Name = "Coins"
+        coins.Value = 0
+        coins.Parent = ls
+    end
+end)
+
+print("GardenAndStealServer loaded")
